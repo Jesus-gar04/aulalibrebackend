@@ -23,7 +23,8 @@ export function requireAuth(req: AuthRequest, res: Response, next: NextFunction)
 }
 
 export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): void {
-  if (req.user?.rol !== 'admin') {
+  const rol = req.user?.rol
+  if (rol !== 'admin' && rol !== 'secretaria') {
     res.status(403).json({ error: 'Se requiere rol de administrador' })
     return
   }
