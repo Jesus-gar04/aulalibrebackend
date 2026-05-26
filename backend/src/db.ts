@@ -25,7 +25,7 @@ export function initDb() {
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       rol TEXT NOT NULL DEFAULT 'estudiante',
-      rol_display TEXT NOT NULL DEFAULT 'Docente',
+      rol_display TEXT NOT NULL DEFAULT 'Estudiante',
       activo INTEGER NOT NULL DEFAULT 1,
       ultimo_acceso TEXT,
       iniciales TEXT NOT NULL
@@ -128,20 +128,6 @@ export function initDb() {
       active INTEGER NOT NULL DEFAULT 1
     );
 
-    CREATE TABLE IF NOT EXISTS schedule_assignments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
-      semestre_num INTEGER NOT NULL,
-      grupo_seccion TEXT NOT NULL,
-      group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-      space_codigo TEXT NOT NULL REFERENCES spaces(codigo) ON DELETE CASCADE,
-      day_index INTEGER NOT NULL REFERENCES schedule_days(day_index),
-      slot_index INTEGER NOT NULL REFERENCES schedule_slots(slot_index),
-      status TEXT NOT NULL DEFAULT 'draft',
-      updated_at TEXT NOT NULL,
-      UNIQUE(program_id, semestre_num, grupo_seccion, group_id, status)
-    );
-
     CREATE TABLE IF NOT EXISTS groups (
       id TEXT PRIMARY KEY,
       codigo TEXT NOT NULL,
@@ -161,6 +147,21 @@ export function initDb() {
       alerta TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS schedule_assignments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+      semestre_num INTEGER NOT NULL,
+      grupo_seccion TEXT NOT NULL,
+      group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      space_codigo TEXT NOT NULL REFERENCES spaces(codigo) ON DELETE CASCADE,
+      day_index INTEGER NOT NULL REFERENCES schedule_days(day_index),
+      slot_index INTEGER NOT NULL REFERENCES schedule_slots(slot_index),
+      status TEXT NOT NULL DEFAULT 'draft',
+      updated_at TEXT NOT NULL,
+      UNIQUE(group_id, day_index, slot_index, status),
+      UNIQUE(space_codigo, day_index, slot_index, status)
+    );
+
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL,
@@ -169,8 +170,56 @@ export function initDb() {
     );
   `)
 
+  migrateDb(db)
   seedScheduleReferenceData(db)
   seedIfEmpty(db)
+}
+
+function migrateDb(db: DatabaseSync) {
+  // Migration 1: Fix broken UNIQUE constraint on schedule_assignments
+  // Old constraint: UNIQUE(program_id, semestre_num, grupo_seccion, group_id, status)
+  // This prevented inserting more than one time slot per group — completely broke scheduling.
+  // New constraints: per-group and per-space uniqueness on (day, slot, status).
+  const tableRow = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='schedule_assignments'"
+  ).get() as { sql: string } | undefined
+
+  if (
+    tableRow?.sql &&
+    tableRow.sql.includes('UNIQUE(program_id, semestre_num, grupo_seccion, group_id, status)')
+  ) {
+    console.log('[DB] Migración 1: corrigiendo UNIQUE constraint de schedule_assignments...')
+    db.exec('DROP TABLE IF EXISTS schedule_assignments')
+    db.exec(`
+      CREATE TABLE schedule_assignments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+        semestre_num INTEGER NOT NULL,
+        grupo_seccion TEXT NOT NULL,
+        group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        space_codigo TEXT NOT NULL REFERENCES spaces(codigo) ON DELETE CASCADE,
+        day_index INTEGER NOT NULL REFERENCES schedule_days(day_index),
+        slot_index INTEGER NOT NULL REFERENCES schedule_slots(slot_index),
+        status TEXT NOT NULL DEFAULT 'draft',
+        updated_at TEXT NOT NULL,
+        UNIQUE(group_id, day_index, slot_index, status),
+        UNIQUE(space_codigo, day_index, slot_index, status)
+      )
+    `)
+    console.log('[DB] Migración 1: completada.')
+  }
+
+  // Migration 2: Add indexes for common queries
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_schedule_assignments_lookup
+      ON schedule_assignments(program_id, semestre_num, grupo_seccion, status);
+    CREATE INDEX IF NOT EXISTS idx_teacher_loads_teacher
+      ON teacher_loads(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_teacher_reports_teacher
+      ON teacher_reports(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_groups_program
+      ON groups(programa_id, semestre_num);
+  `)
 }
 
 function run(db: DatabaseSync, sql: string, ...params: SQLInputValue[]) {
@@ -258,10 +307,11 @@ function seedIfEmpty(db: DatabaseSync) {
   it('d-ruiz', 'Carlos Ruiz', 'Msc.', 'CR', 'Ocasional', 'Departamento de Ciencias Básicas', 'carlos.ruiz@unilibre.edu.co', '+57 302 444 5566', 12, 1, 1, JSON.stringify(['A-102']), 'Ayer')
   il('d-ruiz', 'Física I', 'CB-FIS-110', 'Grupo 01', 'Ing. Industrial', 4, 'Vie 07:00 - 11:00', 'A-102')
 
+  // Dates stored as ISO strings for correct chronological sorting
   run(db, `INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at) VALUES (?,?,?,?,?,?,?)`,
-    'rep-1', 'd-martinez', 'cruce', 'Estructuras de Datos - Grupo B', 'Tengo cruce con comité curricular el martes 9:00-11:00.', 'en_revision', '12 mar 2026')
+    'rep-1', 'd-martinez', 'cruce', 'Estructuras de Datos - Grupo B', 'Tengo cruce con comité curricular el martes 9:00-11:00.', 'en_revision', '2026-03-12')
   run(db, `INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at) VALUES (?,?,?,?,?,?,?)`,
-    'rep-2', 'd-martinez', 'no_disponibilidad', 'Bases de Datos - Grupo A', 'No dispongo del bloque jueves 11:00-13:00 por incapacidad médica.', 'resuelto', '07 mar 2026')
+    'rep-2', 'd-martinez', 'no_disponibilidad', 'Bases de Datos - Grupo A', 'No dispongo del bloque jueves 11:00-13:00 por incapacidad médica.', 'resuelto', '2026-03-07')
 
   run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'B-201', 'Bloque B', 'Aula', 'Teórico', 40, 85, 'book')
   run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'L-101', 'Laboratorio', 'Laboratorio', 'Práctico', 24, 0, 'flask')
