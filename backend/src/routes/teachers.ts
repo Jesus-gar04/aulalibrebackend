@@ -1,9 +1,15 @@
 import { Router } from 'express'
+import crypto from 'crypto'
 import type { SQLInputValue } from 'node:sqlite'
 import { getDb } from '../db'
 import { requireAuth, requireAdmin } from '../middleware/auth'
 
 const router = Router()
+
+function deriveIniciales(nombreCompleto: string): string {
+  const partes = nombreCompleto.trim().split(/\s+/)
+  return ((partes[0]?.[0] ?? '') + (partes[1]?.[0] ?? partes[0]?.[1] ?? '')).toUpperCase() || '??'
+}
 
 function buildTeacher(t: Record<string, unknown>, loads: Record<string, unknown>[]) {
   return {
@@ -42,17 +48,18 @@ router.get('/', requireAuth, (_req, res) => {
   res.json(result)
 })
 
-router.get('/:id', requireAuth, (req, res) => {
+// IMPORTANT: /by-email/:email must come before /:id to avoid ambiguity in single-segment routes
+router.get('/by-email/:email', requireAuth, (req, res) => {
   const db = getDb()
-  const t = db.prepare('SELECT * FROM teachers WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined
+  const t = db.prepare('SELECT * FROM teachers WHERE email = ?').get(decodeURIComponent(req.params.email)) as Record<string, unknown> | undefined
   if (!t) { res.status(404).json({ error: 'Docente no encontrado' }); return }
   const loads = db.prepare('SELECT * FROM teacher_loads WHERE teacher_id = ?').all(t.id as string) as Record<string, unknown>[]
   res.json(buildTeacher(t, loads))
 })
 
-router.get('/by-email/:email', requireAuth, (req, res) => {
+router.get('/:id', requireAuth, (req, res) => {
   const db = getDb()
-  const t = db.prepare('SELECT * FROM teachers WHERE email = ?').get(decodeURIComponent(req.params.email)) as Record<string, unknown> | undefined
+  const t = db.prepare('SELECT * FROM teachers WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined
   if (!t) { res.status(404).json({ error: 'Docente no encontrado' }); return }
   const loads = db.prepare('SELECT * FROM teacher_loads WHERE teacher_id = ?').all(t.id as string) as Record<string, unknown>[]
   res.json(buildTeacher(t, loads))
@@ -67,9 +74,8 @@ router.post('/', requireAuth, requireAdmin, (req, res) => {
     res.status(400).json({ error: 'nombre, email y departamento son requeridos' })
     return
   }
-  const partes = nombreCompleto.trim().split(/\s+/)
-  const iniciales = ((partes[0]?.[0] ?? '') + (partes[1]?.[0] ?? partes[0]?.[1] ?? '')).toUpperCase() || '??'
-  const teacherId = id ?? `d-${Date.now()}`
+  const iniciales = deriveIniciales(nombreCompleto)
+  const teacherId = id ?? `d-${crypto.randomBytes(6).toString('hex')}`
 
   const db = getDb()
   try {
@@ -97,16 +103,29 @@ router.put('/:id', requireAuth, requireAdmin, (req, res) => {
 
   const fields: string[] = []
   const vals: SQLInputValue[] = []
-  if (nombreCompleto) { fields.push('nombre_completo = ?'); vals.push(nombreCompleto as SQLInputValue) }
+  if (nombreCompleto) {
+    fields.push('nombre_completo = ?', 'iniciales = ?')
+    vals.push(nombreCompleto as SQLInputValue, deriveIniciales(nombreCompleto as string))
+  }
   if (tituloProfesional) { fields.push('titulo_profesional = ?'); vals.push(tituloProfesional as SQLInputValue) }
   if (email) { fields.push('email = ?'); vals.push((email as string).toLowerCase()) }
   if (telefono !== undefined) { fields.push('telefono = ?'); vals.push(telefono as SQLInputValue) }
   if (departamento) { fields.push('departamento = ?'); vals.push(departamento as SQLInputValue) }
   if (vinculacion) { fields.push('vinculacion = ?'); vals.push(vinculacion as SQLInputValue) }
-  if (maxHorasSemana) { fields.push('max_horas_semana = ?'); vals.push(maxHorasSemana as SQLInputValue) }
+  if (maxHorasSemana !== undefined) { fields.push('max_horas_semana = ?'); vals.push(maxHorasSemana as SQLInputValue) }
   if (!fields.length) { res.status(400).json({ error: 'Nada que actualizar' }); return }
+
   vals.push(id)
-  db.prepare(`UPDATE teachers SET ${fields.join(', ')} WHERE id = ?`).run(...vals)
+  try {
+    db.prepare(`UPDATE teachers SET ${fields.join(', ')} WHERE id = ?`).run(...vals)
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).message?.includes('UNIQUE')) {
+      res.status(409).json({ error: 'El correo ya está registrado' })
+      return
+    }
+    res.status(500).json({ error: 'Error al actualizar docente' })
+    return
+  }
   const t = db.prepare('SELECT * FROM teachers WHERE id = ?').get(id) as Record<string, unknown>
   const loads = db.prepare('SELECT * FROM teacher_loads WHERE teacher_id = ?').all(id) as Record<string, unknown>[]
   res.json(buildTeacher(t, loads))
@@ -158,7 +177,7 @@ router.put('/:id/availability', requireAuth, (req, res) => {
     db.exec('COMMIT')
     res.json({ message: 'Disponibilidad actualizada' })
   } catch (err) {
-    db.exec('ROLLBACK')
+    try { db.exec('ROLLBACK') } catch { /* no-op si no hay transacción activa */ }
     if (err instanceof Error && err.message === 'INVALID_AVAILABILITY_VALUE') {
       res.status(400).json({ error: 'Cada bloque de disponibilidad debe ser booleano.' })
       return
@@ -180,8 +199,12 @@ router.post('/:id/reports', requireAuth, (req, res) => {
   const { tipo, subject, detail } = req.body as { tipo: string; subject: string; detail: string }
   if (!subject || !detail) { res.status(400).json({ error: 'subject y detail son requeridos' }); return }
   const db = getDb()
-  const reportId = `rep-${Date.now()}`
-  const createdAt = new Date().toLocaleDateString('es-CO', { day: '2-digit', month: 'short', year: 'numeric' })
+  const teacher = db.prepare('SELECT id FROM teachers WHERE id = ?').get(id)
+  if (!teacher) { res.status(404).json({ error: 'Docente no encontrado' }); return }
+
+  const reportId = `rep-${crypto.randomBytes(6).toString('hex')}`
+  // ISO date string for correct chronological ORDER BY
+  const createdAt = new Date().toISOString().slice(0, 10)
   db.prepare(`
     INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at)
     VALUES (?, ?, ?, ?, ?, 'pendiente', ?)
