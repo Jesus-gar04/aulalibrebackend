@@ -3,8 +3,16 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { getDb } from '../db'
+import { requireAuth, type AuthRequest } from '../middleware/auth'
 
 const router = Router()
+
+// Frontend only handles admin|docente|estudiante — secretaria maps to admin for routing
+function toFrontendRole(rol: string): 'admin' | 'docente' | 'estudiante' {
+  if (rol === 'admin' || rol === 'secretaria') return 'admin'
+  if (rol === 'docente') return 'docente'
+  return 'estudiante'
+}
 
 router.post('/login', (req, res) => {
   const { email, password } = req.body as { email: string; password: string }
@@ -23,7 +31,9 @@ router.post('/login', (req, res) => {
     return
   }
 
-  const now = new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+  const now = new Date().toLocaleString('es-CO', {
+    timeZone: 'America/Bogota', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+  })
   db.prepare('UPDATE users SET ultimo_acceso = ? WHERE id = ?').run(now, user.id)
 
   const secret = process.env.JWT_SECRET!
@@ -35,11 +45,32 @@ router.post('/login', (req, res) => {
     user: {
       id: user.id,
       email: user.email,
-      role: user.rol as 'admin' | 'docente' | 'estudiante',
+      role: toFrontendRole(user.rol),
       nombre: user.nombre,
       iniciales: user.iniciales,
       remember: false,
     },
+  })
+})
+
+router.get('/me', requireAuth, (req: AuthRequest, res) => {
+  const db = getDb()
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as
+    | { id: number; nombre: string; email: string; rol: string; rol_display: string; iniciales: string; activo: number }
+    | undefined
+  if (!user) {
+    res.status(404).json({ error: 'Usuario no encontrado' })
+    return
+  }
+  res.json({
+    id: user.id,
+    email: user.email,
+    nombre: user.nombre,
+    iniciales: user.iniciales,
+    rol: user.rol,
+    role: toFrontendRole(user.rol),
+    rolDisplay: user.rol_display,
+    activo: Boolean(user.activo),
   })
 })
 
