@@ -5,6 +5,12 @@ import { requireAuth, requireAdmin } from '../middleware/auth'
 
 const router = Router()
 
+const ICON_MAP: Record<string, string> = {
+  Aula: 'book',
+  Laboratorio: 'flask',
+  'Sala de informática': 'pc',
+}
+
 function calcOcupacion(db: ReturnType<typeof getDb>, codigo: string): number {
   const capacity = db.prepare(`
     SELECT COUNT(*) AS total
@@ -12,11 +18,14 @@ function calcOcupacion(db: ReturnType<typeof getDb>, codigo: string): number {
     CROSS JOIN schedule_slots s
     WHERE d.active = 1 AND s.active = 1 AND s.locked = 0
   `).get() as { total: number }
+
   const used = db.prepare(`
     SELECT COUNT(*) AS total
     FROM schedule_assignments a
     JOIN schedule_slots s ON s.slot_index = a.slot_index
-    WHERE a.space_codigo = ? AND a.status = 'published' AND s.locked = 0
+    JOIN schedule_days d ON d.day_index = a.day_index
+    WHERE a.space_codigo = ? AND a.status = 'published'
+      AND s.locked = 0 AND s.active = 1 AND d.active = 1
   `).get(codigo) as { total: number }
 
   if (!capacity.total) return 0
@@ -32,7 +41,7 @@ function mapSpace(s: Record<string, unknown>, ocupacion?: number) {
     capacidad: s.capacidad,
     ocupacion: ocupacion ?? 0,
     icon: s.icon,
-    claseLaboratorio: s.clase_laboratorio,
+    claseLaboratorio: s.clase_laboratorio ?? null,
     software: JSON.parse((s.software as string) ?? '[]'),
     equipamiento: JSON.parse((s.equipamiento as string) ?? '[]'),
   }
@@ -55,13 +64,13 @@ router.get('/', requireAuth, (req, res) => {
 
 router.post('/', requireAuth, requireAdmin, (req, res) => {
   const { codigo, nombre, tipoEspacio, tipoUso, capacidad, claseLaboratorio, software, equipamiento } = req.body as {
-    codigo: string; nombre: string; tipoEspacio: string; tipoUso: string; capacidad: number;
+    codigo: string; nombre: string; tipoEspacio?: string; tipoUso?: string; capacidad?: number;
     claseLaboratorio?: string; software?: string[]; equipamiento?: Array<{ nombre: string; cantidad: number }>
   }
   if (!codigo || !nombre) { res.status(400).json({ error: 'codigo y nombre son requeridos' }); return }
 
-  const iconMap: Record<string, string> = { Aula: 'book', Laboratorio: 'flask', 'Sala de informática': 'pc' }
-  const icon = iconMap[tipoEspacio] ?? 'book'
+  const tipoEsp = tipoEspacio ?? 'Aula'
+  const icon = ICON_MAP[tipoEsp] ?? 'book'
 
   const db = getDb()
   try {
@@ -69,7 +78,7 @@ router.post('/', requireAuth, requireAdmin, (req, res) => {
       INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, icon, clase_laboratorio, software, equipamiento)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      codigo.trim().toUpperCase(), nombre.trim(), tipoEspacio ?? 'Aula', tipoUso ?? 'Teórico',
+      codigo.trim().toUpperCase(), nombre.trim(), tipoEsp, tipoUso ?? 'Teórico',
       capacidad ?? 40, icon, claseLaboratorio ?? null,
       JSON.stringify(software ?? []), JSON.stringify(equipamiento ?? []),
     )
@@ -82,16 +91,27 @@ router.post('/', requireAuth, requireAdmin, (req, res) => {
 
 router.put('/:codigo', requireAuth, requireAdmin, (req, res) => {
   const { codigo } = req.params
-  const { nombre, tipoUso, capacidad } = req.body as Record<string, unknown>
+  const { nombre, tipoEspacio, tipoUso, capacidad, claseLaboratorio, software, equipamiento } = req.body as {
+    nombre?: string; tipoEspacio?: string; tipoUso?: string; capacidad?: number;
+    claseLaboratorio?: string | null; software?: string[]; equipamiento?: Array<{ nombre: string; cantidad: number }>
+  }
   const db = getDb()
   const existing = db.prepare('SELECT codigo FROM spaces WHERE codigo = ?').get(codigo)
   if (!existing) { res.status(404).json({ error: 'Espacio no encontrado' }); return }
 
   const fields: string[] = []
   const vals: SQLInputValue[] = []
-  if (nombre) { fields.push('nombre = ?'); vals.push(nombre as SQLInputValue) }
-  if (tipoUso) { fields.push('tipo_uso = ?'); vals.push(tipoUso as SQLInputValue) }
+  if (nombre !== undefined) { fields.push('nombre = ?'); vals.push(nombre as SQLInputValue) }
+  if (tipoEspacio !== undefined) {
+    fields.push('tipo_espacio = ?', 'icon = ?')
+    vals.push(tipoEspacio as SQLInputValue, (ICON_MAP[tipoEspacio] ?? 'book') as SQLInputValue)
+  }
+  if (tipoUso !== undefined) { fields.push('tipo_uso = ?'); vals.push(tipoUso as SQLInputValue) }
   if (capacidad !== undefined) { fields.push('capacidad = ?'); vals.push(capacidad as SQLInputValue) }
+  if (claseLaboratorio !== undefined) { fields.push('clase_laboratorio = ?'); vals.push(claseLaboratorio as SQLInputValue) }
+  if (software !== undefined) { fields.push('software = ?'); vals.push(JSON.stringify(software)) }
+  if (equipamiento !== undefined) { fields.push('equipamiento = ?'); vals.push(JSON.stringify(equipamiento)) }
+
   if (!fields.length) { res.status(400).json({ error: 'Nada que actualizar' }); return }
   vals.push(codigo)
   db.prepare(`UPDATE spaces SET ${fields.join(', ')} WHERE codigo = ?`).run(...vals)
