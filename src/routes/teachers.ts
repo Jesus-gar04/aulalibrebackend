@@ -2,9 +2,27 @@ import { Router } from 'express'
 import crypto from 'crypto'
 import type { SQLInputValue } from 'node:sqlite'
 import { getDb } from '../db'
-import { requireAuth, requireAdmin } from '../middleware/auth'
+import { requireAuth, requireAdmin, requireDocente, resolveTeacherFromUser, type AuthRequest } from '../middleware/auth'
 
 const router = Router()
+
+const VALID_REPORT_STATUSES = ['Enviado', 'En revisión', 'Atendido', 'Rechazado'] as const
+type ReportStatus = typeof VALID_REPORT_STATUSES[number]
+
+// Accept common alias spellings (normalize to canonical form)
+const STATUS_ALIASES: Record<string, ReportStatus> = {
+  'enviado': 'Enviado',
+  'en revision': 'En revisión',
+  'en revisión': 'En revisión',
+  'atendido': 'Atendido',
+  'rechazado': 'Rechazado',
+}
+
+function normalizeStatus(raw: string): ReportStatus | undefined {
+  const canonical = VALID_REPORT_STATUSES.find(s => s === raw)
+  if (canonical) return canonical
+  return STATUS_ALIASES[raw.toLowerCase()]
+}
 
 function deriveIniciales(nombreCompleto: string): string {
   const partes = nombreCompleto.trim().split(/\s+/)
@@ -38,6 +56,20 @@ function buildTeacher(t: Record<string, unknown>, loads: Record<string, unknown>
   }
 }
 
+function mapReport(r: Record<string, unknown>) {
+  return {
+    id: r.id,
+    teacherId: r.teacher_id,
+    tipo: r.tipo,
+    subject: r.subject,
+    detail: r.detail,
+    status: r.status,
+    adminResponse: r.admin_response ?? null,
+    createdAt: r.created_at,
+  }
+}
+
+// ── List all teachers ───────────────────────────────────────────────────────
 router.get('/', requireAuth, (_req, res) => {
   const db = getDb()
   const teachers = db.prepare('SELECT * FROM teachers ORDER BY nombre_completo').all() as Record<string, unknown>[]
@@ -48,7 +80,18 @@ router.get('/', requireAuth, (_req, res) => {
   res.json(result)
 })
 
-// IMPORTANT: /by-email/:email must come before /:id to avoid ambiguity in single-segment routes
+// IMPORTANT: named routes must come before /:id to avoid misrouting
+router.get('/reports', requireAuth, requireAdmin, (_req, res) => {
+  const db = getDb()
+  const rows = db.prepare(`
+    SELECT tr.*, t.nombre_completo AS teacher_nombre
+    FROM teacher_reports tr
+    JOIN teachers t ON t.id = tr.teacher_id
+    ORDER BY tr.created_at DESC
+  `).all() as Record<string, unknown>[]
+  res.json(rows.map(r => ({ ...mapReport(r), teacherNombre: r.teacher_nombre })))
+})
+
 router.get('/by-email/:email', requireAuth, (req, res) => {
   const db = getDb()
   const t = db.prepare('SELECT * FROM teachers WHERE email = ?').get(decodeURIComponent(req.params.email)) as Record<string, unknown> | undefined
@@ -57,6 +100,54 @@ router.get('/by-email/:email', requireAuth, (req, res) => {
   res.json(buildTeacher(t, loads))
 })
 
+// ── Admin: update any report (status + response) ───────────────────────────
+router.put('/reports/:reportId', requireAuth, requireAdmin, (req, res) => {
+  const { reportId } = req.params
+  const { status, adminResponse } = req.body as { status?: string; adminResponse?: string }
+
+  const db = getDb()
+  const report = db.prepare('SELECT * FROM teacher_reports WHERE id = ?').get(reportId) as Record<string, unknown> | undefined
+  if (!report) { res.status(404).json({ error: 'Reporte no encontrado' }); return }
+
+  const normalizedStatus = status ? normalizeStatus(status) : undefined
+  if (status && !normalizedStatus) {
+    res.status(400).json({ error: `Estado inválido. Valores permitidos: ${VALID_REPORT_STATUSES.join(', ')}` })
+    return
+  }
+
+  const fields: string[] = []
+  const vals: SQLInputValue[] = []
+  if (normalizedStatus) { fields.push('status = ?'); vals.push(normalizedStatus) }
+  if (adminResponse !== undefined) { fields.push('admin_response = ?'); vals.push(adminResponse) }
+  if (!fields.length) { res.status(400).json({ error: 'Nada que actualizar' }); return }
+
+  vals.push(reportId)
+  db.prepare(`UPDATE teacher_reports SET ${fields.join(', ')} WHERE id = ?`).run(...vals)
+
+  // Notify the teacher about the response
+  if (adminResponse || normalizedStatus === 'Atendido' || normalizedStatus === 'Rechazado') {
+    const teacher = db.prepare('SELECT email FROM teachers WHERE id = ?').get(report.teacher_id as string) as { email: string } | undefined
+    if (teacher) {
+      const user = db.prepare('SELECT id FROM users WHERE email = ?').get(teacher.email) as { id: number } | undefined
+      if (user) {
+        const titulo = normalizedStatus === 'Rechazado'
+          ? 'Tu reporte fue rechazado'
+          : normalizedStatus === 'Atendido'
+            ? 'Tu reporte fue atendido'
+            : 'Hay una respuesta a tu reporte'
+        db.prepare(`
+          INSERT INTO notifications (user_id, tipo, titulo, mensaje, created_at)
+          VALUES (?, 'reporte', ?, ?, ?)
+        `).run(user.id, titulo, adminResponse ?? `El administrador actualizó el estado de tu reporte a "${normalizedStatus}".`, new Date().toISOString())
+      }
+    }
+  }
+
+  const updated = db.prepare('SELECT * FROM teacher_reports WHERE id = ?').get(reportId) as Record<string, unknown>
+  res.json(mapReport(updated))
+})
+
+// ── Single teacher ──────────────────────────────────────────────────────────
 router.get('/:id', requireAuth, (req, res) => {
   const db = getDb()
   const t = db.prepare('SELECT * FROM teachers WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined
@@ -65,6 +156,7 @@ router.get('/:id', requireAuth, (req, res) => {
   res.json(buildTeacher(t, loads))
 })
 
+// ── Create teacher ──────────────────────────────────────────────────────────
 router.post('/', requireAuth, requireAdmin, (req, res) => {
   const { id, nombreCompleto, tituloProfesional, email, telefono, departamento, vinculacion, maxHorasSemana } = req.body as {
     id?: string; nombreCompleto: string; tituloProfesional: string; email: string;
@@ -94,6 +186,7 @@ router.post('/', requireAuth, requireAdmin, (req, res) => {
   }
 })
 
+// ── Update teacher ──────────────────────────────────────────────────────────
 router.put('/:id', requireAuth, requireAdmin, (req, res) => {
   const { id } = req.params
   const { nombreCompleto, tituloProfesional, email, telefono, departamento, vinculacion, maxHorasSemana } = req.body as Record<string, unknown>
@@ -131,6 +224,7 @@ router.put('/:id', requireAuth, requireAdmin, (req, res) => {
   res.json(buildTeacher(t, loads))
 })
 
+// ── Delete teacher ──────────────────────────────────────────────────────────
 router.delete('/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb()
   const result = db.prepare('DELETE FROM teachers WHERE id = ?').run(req.params.id)
@@ -138,7 +232,7 @@ router.delete('/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ message: 'Docente eliminado' })
 })
 
-// Availability
+// ── Availability ────────────────────────────────────────────────────────────
 router.get('/:id/availability', requireAuth, (req, res) => {
   const db = getDb()
   const rows = db.prepare('SELECT slot_key, disponible FROM teacher_availability WHERE teacher_id = ?').all(req.params.id) as { slot_key: string; disponible: number }[]
@@ -147,9 +241,10 @@ router.get('/:id/availability', requireAuth, (req, res) => {
   res.json(result)
 })
 
-router.put('/:id/availability', requireAuth, (req, res) => {
+router.put('/:id/availability', requireAuth, requireDocente, (req: AuthRequest, res) => {
   const { id } = req.params
   const availability = req.body as unknown
+
   if (!availability || Array.isArray(availability) || typeof availability !== 'object') {
     res.status(400).json({ error: 'La disponibilidad debe ser un objeto de bloques.' })
     return
@@ -157,27 +252,30 @@ router.put('/:id/availability', requireAuth, (req, res) => {
 
   const db = getDb()
   const teacher = db.prepare('SELECT id FROM teachers WHERE id = ?').get(id)
-  if (!teacher) {
-    res.status(404).json({ error: 'Docente no encontrado' })
-    return
+  if (!teacher) { res.status(404).json({ error: 'Docente no encontrado' }); return }
+
+  // Non-admin users can only update their own availability
+  const userRol = req.user!.rol
+  if (userRol !== 'admin' && userRol !== 'secretaria') {
+    const linked = resolveTeacherFromUser(req.user!.id)
+    if (linked?.id !== id) {
+      res.status(403).json({ error: 'Solo puedes actualizar tu propia disponibilidad' })
+      return
+    }
   }
 
   try {
     db.exec('BEGIN')
     db.prepare('DELETE FROM teacher_availability WHERE teacher_id = ?').run(id)
-    const insert = db.prepare(
-      'INSERT INTO teacher_availability (teacher_id, slot_key, disponible) VALUES (?, ?, ?)',
-    )
+    const insert = db.prepare('INSERT INTO teacher_availability (teacher_id, slot_key, disponible) VALUES (?, ?, ?)')
     for (const [key, val] of Object.entries(availability as Record<string, unknown>)) {
-      if (typeof val !== 'boolean') {
-        throw new Error('INVALID_AVAILABILITY_VALUE')
-      }
+      if (typeof val !== 'boolean') throw new Error('INVALID_AVAILABILITY_VALUE')
       insert.run(id, key, val ? 1 : 0)
     }
     db.exec('COMMIT')
     res.json({ message: 'Disponibilidad actualizada' })
   } catch (err) {
-    try { db.exec('ROLLBACK') } catch { /* no-op si no hay transacción activa */ }
+    try { db.exec('ROLLBACK') } catch { /* no-op */ }
     if (err instanceof Error && err.message === 'INVALID_AVAILABILITY_VALUE') {
       res.status(400).json({ error: 'Cada bloque de disponibilidad debe ser booleano.' })
       return
@@ -187,29 +285,63 @@ router.put('/:id/availability', requireAuth, (req, res) => {
   }
 })
 
-// Reports
-router.get('/:id/reports', requireAuth, (req, res) => {
+// ── Reports (teacher-scoped) ────────────────────────────────────────────────
+router.get('/:id/reports', requireAuth, (req: AuthRequest, res) => {
+  const { id } = req.params
+
+  // Docentes can only see their own reports
+  const userRol = req.user!.rol
+  if (userRol !== 'admin' && userRol !== 'secretaria') {
+    const linked = resolveTeacherFromUser(req.user!.id)
+    if (linked?.id !== id) {
+      res.status(403).json({ error: 'Solo puedes consultar tus propios reportes' })
+      return
+    }
+  }
+
   const db = getDb()
-  const rows = db.prepare('SELECT * FROM teacher_reports WHERE teacher_id = ? ORDER BY created_at DESC').all(req.params.id)
-  res.json(rows)
+  const rows = db.prepare('SELECT * FROM teacher_reports WHERE teacher_id = ? ORDER BY created_at DESC').all(id)
+  res.json((rows as Record<string, unknown>[]).map(mapReport))
 })
 
-router.post('/:id/reports', requireAuth, (req, res) => {
+router.post('/:id/reports', requireAuth, requireDocente, (req: AuthRequest, res) => {
   const { id } = req.params
   const { tipo, subject, detail } = req.body as { tipo: string; subject: string; detail: string }
   if (!subject || !detail) { res.status(400).json({ error: 'subject y detail son requeridos' }); return }
+
   const db = getDb()
   const teacher = db.prepare('SELECT id FROM teachers WHERE id = ?').get(id)
   if (!teacher) { res.status(404).json({ error: 'Docente no encontrado' }); return }
 
+  // Non-admin users can only create reports for themselves
+  const userRol = req.user!.rol
+  if (userRol !== 'admin' && userRol !== 'secretaria') {
+    const linked = resolveTeacherFromUser(req.user!.id)
+    if (linked?.id !== id) {
+      res.status(403).json({ error: 'Solo puedes crear reportes para tu propio perfil' })
+      return
+    }
+  }
+
   const reportId = `rep-${crypto.randomBytes(6).toString('hex')}`
-  // ISO date string for correct chronological ORDER BY
   const createdAt = new Date().toISOString().slice(0, 10)
   db.prepare(`
     INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at)
-    VALUES (?, ?, ?, ?, ?, 'pendiente', ?)
+    VALUES (?, ?, ?, ?, ?, 'Enviado', ?)
   `).run(reportId, id, tipo ?? 'cruce', subject.trim(), detail.trim(), createdAt)
-  res.status(201).json(db.prepare('SELECT * FROM teacher_reports WHERE id = ?').get(reportId))
+
+  // Notify all admins about the new report
+  const admins = db.prepare("SELECT id FROM users WHERE rol IN ('admin', 'secretaria') AND activo = 1").all() as { id: number }[]
+  const teacherRow = db.prepare('SELECT nombre_completo FROM teachers WHERE id = ?').get(id) as { nombre_completo: string } | undefined
+  const now = new Date().toISOString()
+  for (const admin of admins) {
+    db.prepare(`
+      INSERT INTO notifications (user_id, tipo, titulo, mensaje, created_at)
+      VALUES (?, 'reporte', ?, ?, ?)
+    `).run(admin.id, 'Nuevo reporte de docente', `${teacherRow?.nombre_completo ?? 'Un docente'} reportó: ${subject.trim().slice(0, 80)}`, now)
+  }
+
+  res.status(201).json(mapReport(db.prepare('SELECT * FROM teacher_reports WHERE id = ?').get(reportId) as Record<string, unknown>))
 })
 
 export default router

@@ -86,7 +86,8 @@ export function initDb() {
       tipo TEXT NOT NULL DEFAULT 'cruce',
       subject TEXT NOT NULL,
       detail TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pendiente',
+      status TEXT NOT NULL DEFAULT 'Enviado',
+      admin_response TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -144,6 +145,7 @@ export function initDb() {
       programa_id TEXT REFERENCES programs(id),
       semestre_num INTEGER DEFAULT 1,
       grupo_seccion TEXT DEFAULT 'A',
+      jornada TEXT NOT NULL DEFAULT 'Diurna',
       alerta TEXT
     );
 
@@ -168,6 +170,49 @@ export function initDb() {
       token TEXT NOT NULL UNIQUE,
       expires_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      tipo TEXT NOT NULL DEFAULT 'info',
+      titulo TEXT NOT NULL,
+      mensaje TEXT NOT NULL,
+      leida INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS student_preselections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      student_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      program_id TEXT REFERENCES programs(id),
+      semestre_num INTEGER,
+      status TEXT NOT NULL DEFAULT 'pendiente',
+      conflicts TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS student_preselection_groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      preselection_id INTEGER NOT NULL REFERENCES student_preselections(id) ON DELETE CASCADE,
+      group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      UNIQUE(preselection_id, group_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      titulo TEXT NOT NULL DEFAULT 'Nueva conversación',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `)
 
   migrateDb(db)
@@ -177,9 +222,6 @@ export function initDb() {
 
 function migrateDb(db: DatabaseSync) {
   // Migration 1: Fix broken UNIQUE constraint on schedule_assignments
-  // Old constraint: UNIQUE(program_id, semestre_num, grupo_seccion, group_id, status)
-  // This prevented inserting more than one time slot per group — completely broke scheduling.
-  // New constraints: per-group and per-space uniqueness on (day, slot, status).
   const tableRow = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='schedule_assignments'"
   ).get() as { sql: string } | undefined
@@ -209,7 +251,7 @@ function migrateDb(db: DatabaseSync) {
     console.log('[DB] Migración 1: completada.')
   }
 
-  // Migration 2: Add indexes for common queries
+  // Migration 2: Add indexes
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_schedule_assignments_lookup
       ON schedule_assignments(program_id, semestre_num, grupo_seccion, status);
@@ -219,7 +261,33 @@ function migrateDb(db: DatabaseSync) {
       ON teacher_reports(teacher_id);
     CREATE INDEX IF NOT EXISTS idx_groups_program
       ON groups(programa_id, semestre_num);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user
+      ON notifications(user_id, leida);
+    CREATE INDEX IF NOT EXISTS idx_student_preselections_user
+      ON student_preselections(student_user_id);
   `)
+
+  // Migration 3: Add admin_response to teacher_reports (if not exists)
+  const repCols = db.prepare('PRAGMA table_info(teacher_reports)').all() as { name: string }[]
+  if (!repCols.find(c => c.name === 'admin_response')) {
+    db.exec('ALTER TABLE teacher_reports ADD COLUMN admin_response TEXT')
+    console.log('[DB] Migración 3: admin_response añadido a teacher_reports.')
+  }
+
+  // Migration 4: Add jornada to groups (if not exists)
+  const grpCols = db.prepare('PRAGMA table_info(groups)').all() as { name: string }[]
+  if (!grpCols.find(c => c.name === 'jornada')) {
+    db.exec("ALTER TABLE groups ADD COLUMN jornada TEXT NOT NULL DEFAULT 'Diurna'")
+    console.log('[DB] Migración 4: jornada añadido a groups.')
+  }
+
+  // Migration 5: Normalize legacy teacher_reports status values
+  db.prepare("UPDATE teacher_reports SET status = 'Enviado' WHERE status = 'pendiente'").run()
+  db.prepare("UPDATE teacher_reports SET status = 'En revisión' WHERE status = 'en_revision'").run()
+  db.prepare("UPDATE teacher_reports SET status = 'Atendido' WHERE status = 'resuelto'").run()
+
+  // Migration 6: Unlock all schedule slots (no hardcoded lunch break — admin configures schedule freely)
+  db.prepare('UPDATE schedule_slots SET locked = 0 WHERE locked = 1').run()
 }
 
 function run(db: DatabaseSync, sql: string, ...params: SQLInputValue[]) {
@@ -227,7 +295,7 @@ function run(db: DatabaseSync, sql: string, ...params: SQLInputValue[]) {
 }
 
 function seedScheduleReferenceData(db: DatabaseSync) {
-  const days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes']
+  const days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado']
   days.forEach((label, index) => {
     run(db, 'INSERT OR IGNORE INTO schedule_days (day_index, label) VALUES (?, ?)', index, label)
   })
@@ -236,7 +304,10 @@ function seedScheduleReferenceData(db: DatabaseSync) {
     { label: '07:00 - 09:00', start: '07:00', end: '09:00', hours: 2, locked: 0 },
     { label: '09:00 - 11:00', start: '09:00', end: '11:00', hours: 2, locked: 0 },
     { label: '11:00 - 13:00', start: '11:00', end: '13:00', hours: 2, locked: 0 },
-    { label: '13:00 - 15:00', start: '13:00', end: '15:00', hours: 2, locked: 1 },
+    { label: '13:00 - 15:00', start: '13:00', end: '15:00', hours: 2, locked: 0 },
+    { label: '15:00 - 17:00', start: '15:00', end: '17:00', hours: 2, locked: 0 },
+    { label: '17:00 - 19:00', start: '17:00', end: '19:00', hours: 2, locked: 0 },
+    { label: '19:00 - 21:00', start: '19:00', end: '21:00', hours: 2, locked: 0 },
   ]
   slots.forEach((slot, index) => {
     run(
@@ -245,6 +316,50 @@ function seedScheduleReferenceData(db: DatabaseSync) {
       index, slot.label, slot.start, slot.end, slot.hours, slot.locked,
     )
   })
+}
+
+export function syncTeacherStats(db: DatabaseSync, teacherId: string) {
+  const stats = db.prepare(`
+    SELECT
+      COUNT(DISTINCT g.id) AS grupos_activos,
+      COUNT(DISTINCT g.asignatura) AS asignaturas_distintas
+    FROM schedule_assignments sa
+    JOIN groups g ON g.id = sa.group_id
+    WHERE g.teacher_id = ? AND sa.status = 'published'
+  `).get(teacherId) as { grupos_activos: number; asignaturas_distintas: number }
+
+  const espacios = db.prepare(`
+    SELECT DISTINCT sa.space_codigo
+    FROM schedule_assignments sa
+    JOIN groups g ON g.id = sa.group_id
+    WHERE g.teacher_id = ? AND sa.status = 'published'
+    LIMIT 5
+  `).all(teacherId) as { space_codigo: string }[]
+
+  const now = new Date().toLocaleString('es-CO', {
+    timeZone: 'America/Bogota', day: '2-digit', month: 'short',
+    hour: '2-digit', minute: '2-digit',
+  })
+
+  db.prepare(`
+    UPDATE teachers SET
+      grupos_activos = ?,
+      asignaturas_distintas = ?,
+      espacios_frecuentes = ?,
+      ultima_actualizacion_carga = ?
+    WHERE id = ?
+  `).run(
+    stats.grupos_activos,
+    stats.asignaturas_distintas,
+    JSON.stringify(espacios.map(e => e.space_codigo)),
+    now,
+    teacherId,
+  )
+}
+
+export function syncAllTeacherStats(db: DatabaseSync) {
+  const teachers = db.prepare('SELECT id FROM teachers').all() as { id: string }[]
+  for (const t of teachers) syncTeacherStats(db, t.id)
 }
 
 function seedIfEmpty(db: DatabaseSync) {
@@ -307,28 +422,28 @@ function seedIfEmpty(db: DatabaseSync) {
   it('d-ruiz', 'Carlos Ruiz', 'Msc.', 'CR', 'Ocasional', 'Departamento de Ciencias Básicas', 'carlos.ruiz@unilibre.edu.co', '+57 302 444 5566', 12, 1, 1, JSON.stringify(['A-102']), 'Ayer')
   il('d-ruiz', 'Física I', 'CB-FIS-110', 'Grupo 01', 'Ing. Industrial', 4, 'Vie 07:00 - 11:00', 'A-102')
 
-  // Dates stored as ISO strings for correct chronological sorting
   run(db, `INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at) VALUES (?,?,?,?,?,?,?)`,
-    'rep-1', 'd-martinez', 'cruce', 'Estructuras de Datos - Grupo B', 'Tengo cruce con comité curricular el martes 9:00-11:00.', 'en_revision', '2026-03-12')
+    'rep-1', 'd-martinez', 'cruce', 'Estructuras de Datos - Grupo B', 'Tengo cruce con comité curricular el martes 9:00-11:00.', 'En revisión', '2026-03-12')
   run(db, `INSERT INTO teacher_reports (id, teacher_id, tipo, subject, detail, status, created_at) VALUES (?,?,?,?,?,?,?)`,
-    'rep-2', 'd-martinez', 'no_disponibilidad', 'Bases de Datos - Grupo A', 'No dispongo del bloque jueves 11:00-13:00 por incapacidad médica.', 'resuelto', '2026-03-07')
+    'rep-2', 'd-martinez', 'no_disponibilidad', 'Bases de Datos - Grupo A', 'No dispongo del bloque jueves 11:00-13:00 por incapacidad médica.', 'Atendido', '2026-03-07')
 
-  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'B-201', 'Bloque B', 'Aula', 'Teórico', 40, 85, 'book')
-  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'L-101', 'Laboratorio', 'Laboratorio', 'Práctico', 24, 0, 'flask')
-  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'C-305', 'Sistemas', 'Aula', 'Teórico', 40, 100, 'book')
-  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'SC-02', 'Sala de cómputo', 'Sala de informática', 'Mixto', 30, 45, 'pc')
+  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'B-201', 'Bloque B - Aula 201', 'Aula', 'Teórico', 40, 0, 'book')
+  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'L-101', 'Laboratorio 101', 'Laboratorio', 'Práctico', 24, 0, 'flask')
+  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'C-305', 'Sala Sistemas 305', 'Sala de informática', 'Mixto', 40, 0, 'pc')
+  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'SC-02', 'Sala de Cómputo 02', 'Sala de informática', 'Mixto', 30, 0, 'pc')
+  run(db, `INSERT INTO spaces (codigo, nombre, tipo_espacio, tipo_uso, capacidad, ocupacion, icon) VALUES (?,?,?,?,?,?,?)`, 'A-102', 'Aula A-102', 'Aula', 'Teórico', 50, 0, 'book')
 
-  const ig = (id: string, c: string, n: string, sem: string, cmax: number, cpl: number, tid: string | null, doc: string | null, ini: string | null, ep: string, asig: string | null, h: number, pid: string | null, sn: number, gs: string) =>
-    run(db, `INSERT INTO groups (id, codigo, nombre, semestre, cupo_max, cupo_planeado, teacher_id, docente, docente_iniciales, estado_prog, asignatura, horas, programa_id, semestre_num, grupo_seccion) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, c, n, sem, cmax, cpl, tid, doc, ini, ep, asig, h, pid, sn, gs)
-  ig('01', '01', 'Grupo 01', 'Semestre 3', 40, 40, 'd-martinez', 'Alberto Martínez', 'AM', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 3, 'A')
-  ig('02', '02', 'Grupo 02', 'Semestre 3', 40, 40, 'd-gomez', 'Laura Gómez', 'LG', 'pendiente', 'Programación Orientada a Objetos', 4, 'sis', 3, 'B')
-  ig('03', '03', 'Grupo 03', 'Semestre 3', 40, 40, null, null, null, 'pendiente', 'Programación Orientada a Objetos', 4, 'sis', 3, 'C')
-  ig('04', '04', 'Grupo 04', 'Semestre 3', 40, 40, 'd-ruiz', 'Carlos Ruiz', 'CR', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 3, 'D')
-  ig('sis-4a-poo', 'A', 'Grupo A', 'Semestre 4', 38, 38, 'd-gomez', 'Gómez, L.', 'LG', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 4, 'A')
-  ig('sis-4b-poo', 'B', 'Grupo B', 'Semestre 4', 40, 40, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 4, 'B')
-  ig('sis-5a-ed', 'A', 'Grupo A', 'Semestre 5', 35, 35, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Estructuras de Datos', 4, 'sis', 5, 'A')
-  ig('sis-5a-bd', 'A', 'Grupo A', 'Semestre 5', 35, 35, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Bases de Datos', 4, 'sis', 5, 'A')
-  ig('sis-5a-iso', 'A', 'Grupo A', 'Semestre 5', 34, 34, 'd-gomez', 'Gómez, L.', 'LG', 'horario', 'Ingeniería de Software I', 4, 'sis', 5, 'A')
+  const ig = (id: string, c: string, n: string, sem: string, cmax: number, cpl: number, tid: string | null, doc: string | null, ini: string | null, ep: string, asig: string | null, h: number, pid: string | null, sn: number, gs: string, jor: string) =>
+    run(db, `INSERT INTO groups (id, codigo, nombre, semestre, cupo_max, cupo_planeado, teacher_id, docente, docente_iniciales, estado_prog, asignatura, horas, programa_id, semestre_num, grupo_seccion, jornada) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, c, n, sem, cmax, cpl, tid, doc, ini, ep, asig, h, pid, sn, gs, jor)
+  ig('01', '01', 'Grupo 01', 'Semestre 3', 40, 40, 'd-martinez', 'Alberto Martínez', 'AM', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 3, 'A', 'Diurna')
+  ig('02', '02', 'Grupo 02', 'Semestre 3', 40, 40, 'd-gomez', 'Laura Gómez', 'LG', 'pendiente', 'Programación Orientada a Objetos', 4, 'sis', 3, 'B', 'Diurna')
+  ig('03', '03', 'Grupo 03', 'Semestre 3', 40, 40, null, null, null, 'pendiente', 'Programación Orientada a Objetos', 4, 'sis', 3, 'C', 'Diurna')
+  ig('04', '04', 'Grupo 04', 'Semestre 3', 40, 40, 'd-ruiz', 'Carlos Ruiz', 'CR', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 3, 'D', 'Nocturna')
+  ig('sis-4a-poo', 'A', 'Grupo A', 'Semestre 4', 38, 38, 'd-gomez', 'Gómez, L.', 'LG', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 4, 'A', 'Diurna')
+  ig('sis-4b-poo', 'B', 'Grupo B', 'Semestre 4', 40, 40, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Programación Orientada a Objetos', 4, 'sis', 4, 'B', 'Diurna')
+  ig('sis-5a-ed', 'A', 'Grupo A', 'Semestre 5', 35, 35, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Estructuras de Datos', 4, 'sis', 5, 'A', 'Diurna')
+  ig('sis-5a-bd', 'A', 'Grupo A', 'Semestre 5', 35, 35, 'd-martinez', 'Martinez, A.', 'AM', 'horario', 'Bases de Datos', 4, 'sis', 5, 'A', 'Diurna')
+  ig('sis-5a-iso', 'A', 'Grupo A', 'Semestre 5', 34, 34, 'd-gomez', 'Gómez, L.', 'LG', 'horario', 'Ingeniería de Software I', 4, 'sis', 5, 'A', 'Diurna')
 
   console.log('✓ Base de datos inicializada con datos semilla')
 }
